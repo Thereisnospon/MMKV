@@ -58,13 +58,13 @@ enum : bool {
 
 MMKV::MMKV(const std::string &mmapID, int size, MMKVMode mode, string *cryptKey)
     : m_mmapID(mmapID)
-    , m_path(mappedKVPathWithID(m_mmapID, mode))
-    , m_crcPath(crcPathWithID(m_mmapID, mode))
-    , m_metaFile(m_crcPath, DEFAULT_MMAP_SIZE, (mode & MMKV_ASHMEM) ? MMAP_ASHMEM : MMAP_FILE)
+    , m_path(mappedKVPathWithID(m_mmapID, mode)) //根据mmapId创建数据存储文件路径
+    , m_crcPath(crcPathWithID(m_mmapID, mode)) //meta 文件路径
+    , m_metaFile(m_crcPath, DEFAULT_MMAP_SIZE, (mode & MMKV_ASHMEM) ? MMAP_ASHMEM : MMAP_FILE) //meta文件
     , m_crypter(nullptr)
-    , m_fileLock(m_metaFile.getFd())
-    , m_sharedProcessLock(&m_fileLock, SharedLockType)
-    , m_exclusiveProcessLock(&m_fileLock, ExclusiveLockType)
+    , m_fileLock(m_metaFile.getFd()) //用meta文件fd做文件锁
+    , m_sharedProcessLock(&m_fileLock, SharedLockType) //用meta文件的文件锁封装一个共享锁
+    , m_exclusiveProcessLock(&m_fileLock, ExclusiveLockType)//用meta文件的文件锁封装一个排它锁
     , m_isInterProcess((mode & MMKV_MULTI_PROCESS) != 0)
     , m_isAshmem((mode & MMKV_ASHMEM) != 0) {
     m_fd = -1;
@@ -72,14 +72,14 @@ MMKV::MMKV(const std::string &mmapID, int size, MMKVMode mode, string *cryptKey)
     m_size = 0;
     m_actualSize = 0;
     m_output = nullptr;
-
+    //ashmen 模式
     if (m_isAshmem) {
         m_ashmemFile = new MmapedFile(m_mmapID, static_cast<size_t>(size), MMAP_ASHMEM);
         m_fd = m_ashmemFile->getFd();
     } else {
         m_ashmemFile = nullptr;
     }
-
+    //密钥
     if (cryptKey && cryptKey->length() > 0) {
         m_crypter = new AESCrypt((const unsigned char *) cryptKey->data(), cryptKey->length());
     }
@@ -93,7 +93,9 @@ MMKV::MMKV(const std::string &mmapID, int size, MMKVMode mode, string *cryptKey)
 
     // sensitive zone
     {
+        //加共享锁
         SCOPEDLOCK(m_sharedProcessLock);
+        //加载数据
         loadFromFile();
     }
 }
@@ -269,47 +271,58 @@ void MMKV::loadFromFile() {
         loadFromAshmem();
         return;
     }
-
+    //从mmap的内存地址读取meta数据
     m_metaInfo.read(m_metaFile.getMemory());
-
+    //open mmkv 数据文件
     m_fd = open(m_path.c_str(), O_RDWR | O_CREAT, S_IRWXU);
     if (m_fd < 0) {
         MMKVError("fail to open:%s, %s", m_path.c_str(), strerror(errno));
     } else {
         m_size = 0;
         struct stat st = {0};
+        //读取文件状态。(:文件大小
         if (fstat(m_fd, &st) != -1) {
             m_size = static_cast<size_t>(st.st_size);
         }
-        // round up to (n * pagesize)
+        // round up to (n * pagesize) 填充文件大小到页大小的整数倍
         if (m_size < DEFAULT_MMAP_SIZE || (m_size % DEFAULT_MMAP_SIZE != 0)) {
             size_t oldSize = m_size;
-            m_size = ((m_size / DEFAULT_MMAP_SIZE) + 1) * DEFAULT_MMAP_SIZE;
+            m_size = ((m_size / DEFAULT_MMAP_SIZE) + 1) * DEFAULT_MMAP_SIZE;、
+            //扩容
             if (ftruncate(m_fd, m_size) != 0) {
                 MMKVError("fail to truncate [%s] to size %zu, %s", m_mmapID.c_str(), m_size,
                           strerror(errno));
                 m_size = static_cast<size_t>(st.st_size);
             }
+            //扩容的空间填充0
             zeroFillFile(m_fd, oldSize, m_size - oldSize);
         }
+        //mmap mmkv数据文件到内存
         m_ptr = (char *) mmap(nullptr, m_size, PROT_READ | PROT_WRITE, MAP_SHARED, m_fd, 0);
         if (m_ptr == MAP_FAILED) {
             MMKVError("fail to mmap [%s], %s", m_mmapID.c_str(), strerror(errno));
         } else {
+            //?? 从数据文件开头读取 实际存储的数据大小？？
             memcpy(&m_actualSize, m_ptr, Fixed32Size);
             MMKVInfo("loading [%s] with %zu size in total, file size is %zu", m_mmapID.c_str(),
                      m_actualSize, m_size);
             bool loaded = false;
+            // 已经有数据了
             if (m_actualSize > 0) {
                 if (m_actualSize < m_size && m_actualSize + Fixed32Size <= m_size) {
+                    //crc 校验
                     if (checkFileCRCValid()) {
                         MMKVInfo("loading [%s] with crc %u sequence %u", m_mmapID.c_str(),
                                  m_metaInfo.m_crcDigest, m_metaInfo.m_sequence);
+                        //越过文件开头的 数据大小区域，创建一个actualSize 大小的内存buffer
                         MMBuffer inputBuffer(m_ptr + Fixed32Size, m_actualSize, MMBufferNoCopy);
                         if (m_crypter) {
+                            //解密
                             decryptBuffer(*m_crypter, inputBuffer);
                         }
+                        //解析为 dic
                         m_dic = MiniPBCoder::decodeMap(inputBuffer);
+                        // 写数据为 append 到原数据尾部
                         m_output = new CodedOutputData(m_ptr + Fixed32Size + m_actualSize,
                                                        m_size - Fixed32Size - m_actualSize);
                         loaded = true;
@@ -317,12 +330,15 @@ void MMKV::loadFromFile() {
                 }
             }
             if (!loaded) {
+                //没加载成功，要写数据，加排它锁
                 SCOPEDLOCK(m_exclusiveProcessLock);
 
                 if (m_actualSize > 0) {
+                    //重置大小为0
                     writeAcutalSize(0);
                 }
                 m_output = new CodedOutputData(m_ptr + Fixed32Size, m_size - Fixed32Size);
+                //重新计算CRC
                 recaculateCRCDigest();
             }
             MMKVInfo("loaded [%s] with %zu values", m_mmapID.c_str(), m_dic.size());
@@ -387,22 +403,27 @@ void MMKV::loadFromAshmem() {
 
 // read from last m_position
 void MMKV::partialLoadFromFile() {
+    //重新读取 metainfo
     m_metaInfo.read(m_metaFile.getMemory());
-
+    //暂存
     size_t oldActualSize = m_actualSize;
+    //读取新的数据大小
     memcpy(&m_actualSize, m_ptr, Fixed32Size);
     MMKVDebug("loading [%s] with file size %zu, oldActualSize %zu, newActualSize %zu",
               m_mmapID.c_str(), m_size, oldActualSize, m_actualSize);
 
     if (m_actualSize > 0) {
         if (m_actualSize < m_size && m_actualSize + Fixed32Size <= m_size) {
+            //比原来的数据大
             if (m_actualSize > oldActualSize) {
                 size_t bufferSize = m_actualSize - oldActualSize;
                 MMBuffer inputBuffer(m_ptr + Fixed32Size + oldActualSize, bufferSize,
                                      MMBufferNoCopy);
                 // incremental update crc digest
+                //计算 CRC 与读取的CRC 比较
                 m_crcDigest = (uint32_t) crc32(m_crcDigest, (const uint8_t *) inputBuffer.getPtr(),
                                                static_cast<uInt>(inputBuffer.length()));
+                //读取 这段时间 append 的数据。追加到当前 dict
                 if (m_crcDigest == m_metaInfo.m_crcDigest) {
                     if (m_crypter) {
                         decryptBuffer(*m_crypter, inputBuffer);
@@ -417,6 +438,7 @@ void MMKV::partialLoadFromFile() {
                             target->second = std::move(itr.second);
                         }
                     }
+                    //设置写指针
                     m_output->seek(bufferSize);
 
                     MMKVDebug("partial loaded [%s] with %zu values", m_mmapID.c_str(),
@@ -435,6 +457,7 @@ void MMKV::partialLoadFromFile() {
 }
 
 void MMKV::checkLoadData() {
+    //被标记重新读取文件。直接重新读取文件
     if (m_needLoadFromFile) {
         SCOPEDLOCK(m_sharedProcessLock);
 
@@ -442,13 +465,16 @@ void MMKV::checkLoadData() {
         loadFromFile();
         return;
     }
+    //TODO: WHY
     if (!m_isInterProcess) {
         return;
     }
 
     // TODO: atomic lock m_metaFile?
     MMKVMetaInfo metaInfo;
+    //重新读取metainfo
     metaInfo.read(m_metaFile.getMemory());
+    //序列号不一致，重新读取文件
     if (m_metaInfo.m_sequence != metaInfo.m_sequence) {
         MMKVInfo("[%s] oldSeq %u, newSeq %u", m_mmapID.c_str(), m_metaInfo.m_sequence,
                  metaInfo.m_sequence);
@@ -470,12 +496,14 @@ void MMKV::checkLoadData() {
                 fileSize = (size_t) st.st_size;
             }
         }
+        //文件大小不一致，重新读取文件
         if (m_size != fileSize) {
             MMKVInfo("file size has changed [%s] from %zu to %zu", m_mmapID.c_str(), m_size,
                      fileSize);
             clearMemoryState();
             loadFromFile();
         } else {
+            //文件大小一致
             partialLoadFromFile();
         }
     }
@@ -562,25 +590,31 @@ bool MMKV::ensureMemorySize(size_t newSize) {
         MMKVWarning("[%s] file not valid", m_mmapID.c_str());
         return false;
     }
-
+    //需要的大小大于当前剩余的
     if (newSize >= m_output->spaceLeft()) {
         // try a full rewrite to make space
         static const int offset = pbFixed32Size(0);
+        //当前数据 encode,( 因为dic保存的是无重复key的。而文件/内存中是有重复append的key的，所以重新encode，会重整空间
         MMBuffer data = MiniPBCoder::encodeDataWithObject(m_dic);
+        //需要目标大小
         size_t lenNeeded = data.length() + offset + newSize;
         if (m_isAshmem) {
+            //ashmen 不允许扩展
             if (lenNeeded > m_size) {
                 MMKVWarning("ashmem %s reach size limit:%zu, consider configure with larger size",
                             m_mmapID.c_str(), m_size);
                 return false;
             }
         } else {
+            // 至少扩展 8 个单位的 newSize
             size_t futureUsage = newSize * std::max<size_t>(8, (m_dic.size() + 1) / 2);
             // 1. no space for a full rewrite, double it
             // 2. or space is not large enough for future usage, double it to avoid frequently full rewrite
+            // 大于当前文件大小
             if (lenNeeded >= m_size || (lenNeeded + futureUsage) >= m_size) {
                 size_t oldSize = m_size;
                 do {
+                    //一直double扩展。直到满足条件
                     m_size *= 2;
                 } while (lenNeeded + futureUsage >= m_size);
                 MMKVInfo(
@@ -588,22 +622,27 @@ bool MMKV::ensureMemorySize(size_t newSize) {
                     m_mmapID.c_str(), oldSize, m_size, newSize, futureUsage);
 
                 // if we can't extend size, rollback to old state
+                //扩展文件大小
                 if (ftruncate(m_fd, m_size) != 0) {
                     MMKVError("fail to truncate [%s] to size %zu, %s", m_mmapID.c_str(), m_size,
                               strerror(errno));
+                    //回滚到原文件大小
                     m_size = oldSize;
                     return false;
                 }
+                //填充扩展的区域
                 if (!zeroFillFile(m_fd, oldSize, m_size - oldSize)) {
                     MMKVError("fail to zeroFile [%s] to size %zu, %s", m_mmapID.c_str(), m_size,
                               strerror(errno));
+                    //回滚到原文件大小
                     m_size = oldSize;
                     return false;
                 }
-
+                //解除原来的mmap映射
                 if (munmap(m_ptr, oldSize) != 0) {
                     MMKVError("fail to munmap [%s], %s", m_mmapID.c_str(), strerror(errno));
                 }
+                //创建新的mmap映射
                 m_ptr = (char *) mmap(m_ptr, m_size, PROT_READ | PROT_WRITE, MAP_SHARED, m_fd, 0);
                 if (m_ptr == MAP_FAILED) {
                     MMKVError("fail to mmap [%s], %s", m_mmapID.c_str(), strerror(errno));
@@ -616,17 +655,18 @@ bool MMKV::ensureMemorySize(size_t newSize) {
                 }
             }
         }
-
+        //重新设置 crypter
         if (m_crypter) {
             m_crypter->reset();
             auto ptr = (unsigned char *) data.getPtr();
             m_crypter->encrypt(ptr, ptr, data.length());
         }
-
+        //写回新的数据大小
         writeAcutalSize(data.length());
 
         delete m_output;
         m_output = new CodedOutputData(m_ptr + offset, m_size - offset);
+        //写回数据。重新计算CRC
         m_output->writeRawData(data);
         recaculateCRCDigest();
     }
@@ -656,18 +696,22 @@ bool MMKV::setDataForKey(MMBuffer &&data, const std::string &key) {
     if (data.length() == 0 || key.empty()) {
         return false;
     }
+    //线程锁？
     SCOPEDLOCK(m_lock);
+    //写数据，加排他锁
     SCOPEDLOCK(m_exclusiveProcessLock);
+    //写之前先看下是否要重新读取
     checkLoadData();
 
     // m_dic[key] = std::move(data);
+    // 先 内存中 dic 中更新
     auto itr = m_dic.find(key);
     if (itr == m_dic.end()) {
         itr = m_dic.emplace(key, std::move(data)).first;
     } else {
         itr->second = std::move(data);
     }
-
+    //追加到尾部
     return appendDataWithKey(itr->second, key);
 }
 
@@ -675,10 +719,11 @@ bool MMKV::removeDataForKey(const std::string &key) {
     if (key.empty()) {
         return false;
     }
-
+    //dict 中删除
     auto deleteCount = m_dic.erase(key);
     if (deleteCount > 0) {
         static MMBuffer nan(0);
+        //追加一个空的key
         return appendDataWithKey(nan, key);
     }
 
@@ -692,6 +737,7 @@ bool MMKV::appendDataWithKey(const MMBuffer &data, const std::string &key) {
     // size needed to encode the value
     size += data.length() + pbRawVarint32Size((int32_t) data.length());
 
+    //排它锁
     SCOPEDLOCK(m_exclusiveProcessLock);
 
     bool hasEnoughSize = ensureMemorySize(size);
@@ -722,12 +768,13 @@ bool MMKV::appendDataWithKey(const MMBuffer &data, const std::string &key) {
         if (m_crypter) {
             m_crypter->encrypt(ptr, ptr, size);
         }
+        //重新计算，不修改 sequence
         updateCRCDigest(ptr, size, KeepSequence);
 
         return true;
     }
 }
-
+//完全写回
 bool MMKV::fullWriteback() {
     if (m_needLoadFromFile) {
         return true;
@@ -765,6 +812,11 @@ bool MMKV::fullWriteback() {
     return false;
 }
 
+/**
+ * 重设 加密的 key
+ * @param cryptKey
+ * @return
+ */
 bool MMKV::reKey(const std::string &cryptKey) {
     SCOPEDLOCK(m_lock);
     checkLoadData();
@@ -867,8 +919,10 @@ bool MMKV::isFileValid() {
 bool MMKV::checkFileCRCValid() {
     if (m_ptr && m_ptr != MAP_FAILED) {
         constexpr int offset = pbFixed32Size(0);
+        //计算当前的CRC
         m_crcDigest =
             (uint32_t) crc32(0, (const uint8_t *) m_ptr + offset, (uint32_t) m_actualSize);
+        //重新读取
         m_metaInfo.read(m_metaFile.getMemory());
         if (m_crcDigest == m_metaInfo.m_crcDigest) {
             return true;
@@ -883,6 +937,7 @@ void MMKV::recaculateCRCDigest() {
     if (m_ptr && m_ptr != MAP_FAILED) {
         m_crcDigest = 0;
         constexpr int offset = pbFixed32Size(0);
+        //重新计算CRC，修改 sequence
         updateCRCDigest((const uint8_t *) m_ptr + offset, m_actualSize, IncreaseSequence);
     }
 }
@@ -931,7 +986,9 @@ bool MMKV::setBool(bool value, const std::string &key) {
         return false;
     }
     size_t size = pbBoolSize(value);
+    //malloc一块内存
     MMBuffer data(size);
+    //写到内存
     CodedOutputData output(data.getPtr(), size);
     output.writeBool(value);
 
@@ -1120,6 +1177,7 @@ std::vector<std::string> MMKV::allKeys() {
     return keys;
 }
 
+//删除key
 void MMKV::removeValueForKey(const std::string &key) {
     if (key.empty()) {
         return;
@@ -1157,6 +1215,7 @@ void MMKV::sync() {
         return;
     }
     SCOPEDLOCK(m_exclusiveProcessLock);
+    //磁盘与共享区同步
     if (msync(m_ptr, m_size, MS_SYNC) != 0) {
         MMKVError("fail to msync [%s]:%s", m_mmapID.c_str(), strerror(errno));
     }

@@ -40,6 +40,9 @@ extern const int DEFAULT_MMAP_SIZE;
 class MmapedFile {
     std::string m_name;
     int m_fd;
+    /*
+     * mmap 到内存的地址
+     */
     void *m_segmentPtr;
     size_t m_segmentSize;
 

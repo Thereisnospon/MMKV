@@ -44,6 +44,7 @@ MmapedFile::MmapedFile(const std::string &path, size_t size, bool fileType)
             if (fstat(m_fd, &st) != -1) {
                 m_segmentSize = static_cast<size_t>(st.st_size);
             }
+            //文件小于一个 PAGE ,扩展大小
             if (m_segmentSize < DEFAULT_MMAP_SIZE) {
                 m_segmentSize = static_cast<size_t>(DEFAULT_MMAP_SIZE);
                 if (ftruncate(m_fd, m_segmentSize) != 0 || !zeroFillFile(m_fd, 0, m_segmentSize)) {
@@ -55,6 +56,7 @@ MmapedFile::MmapedFile(const std::string &path, size_t size, bool fileType)
                     return;
                 }
             }
+            //mmap 内存映射
             m_segmentPtr =
                 (char *) mmap(nullptr, m_segmentSize, PROT_READ | PROT_WRITE, MAP_SHARED, m_fd, 0);
             if (m_segmentPtr == MAP_FAILED) {
@@ -64,7 +66,7 @@ MmapedFile::MmapedFile(const std::string &path, size_t size, bool fileType)
                 m_segmentPtr = nullptr;
             }
         }
-    } else {
+    } else { //ashmen
         m_fd = open(ASHMEM_NAME_DEF, O_RDWR);
         if (m_fd < 0) {
             MMKVError("fail to open ashmem:%s, %s", m_name.c_str(), strerror(errno));

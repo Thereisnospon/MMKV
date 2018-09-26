@@ -147,10 +147,13 @@ public class MMKV implements SharedPreferences, SharedPreferences.Editor {
 
     public native String mmapID();
 
+    //加排它锁
     public native void lock();
 
+    //解排它锁
     public native void unlock();
 
+    //非阻塞加锁
     public native boolean tryLock();
 
     public boolean encode(String key, boolean value) {
@@ -275,6 +278,8 @@ public class MMKV implements SharedPreferences, SharedPreferences.Editor {
     // call on memory warning
     public native void clearMemoryCache();
 
+
+    //磁盘 - 共享内存 sync
     // you don't need to call this, really, I mean it
     // unless you care about out of battery
     public native void sync();
@@ -498,11 +503,15 @@ public class MMKV implements SharedPreferences, SharedPreferences.Editor {
 
     private native byte[] decodeBytes(long handle, String key);
 
+    //包含key
     private native boolean containsKey(long handle, String key);
 
+    //key 数量
     private native long count(long handle);
 
+    //文件大小
     private native long totalSize(long handle);
 
+    //删除key : ( 追加一个空的 key
     private native void removeValueForKey(long handle, String key);
 }
